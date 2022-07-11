@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+# /////////////////////// Patch-wise Pyramid Context Network (PPCN)
 def make_model(args, parent=False):
     return Net()
 
@@ -12,9 +14,10 @@ def default_conv(in_channels, out_channels, kernel_size, bias=True):
         padding=(kernel_size // 2), bias=bias)
 
 
-class MGCB(nn.Module):
+# spatially-aware context attention
+class SCA(nn.Module):
     def __init__(self, in_channels, reduction):
-        super(MGCB, self).__init__()
+        super(SCA, self).__init__()
         self.reduction = reduction
         self.k = in_channels // self.reduction  # 64 // 16 = 4
         self.in_channels = in_channels
@@ -73,22 +76,22 @@ class CALayer(nn.Module):
         return x * y
 
 
-# Attention 
+# Attention || 直接相加的操作
 class Attention(nn.Module):
     def __init__(self, in_channels, reduction=16):
         super(Attention, self).__init__()
-        self.mgcb = MGCB(in_channels, reduction)
+        self.sca = SCA(in_channels, reduction)
         self.ca = CALayer(in_channels, reduction)
 
     def forward(self, x):
-        x1 = self.mgcb(x)
+        x1 = self.sca(x)
         x2 = self.ca(x)
         return x1 + x2
 
 
 # residual block
 # class ResBlock(nn.Module):
-#     def __init__(self, conv, in_channels, kernel_size, bias=True, bn=False, act=nn.ReLU(True), res_MGCBle=1):
+#     def __init__(self, conv, in_channels, kernel_size, bias=True, bn=False, act=nn.ReLU(True), res_scale=1):
 
 #         super(ResBlock, self).__init__()
 #         m = []
@@ -98,18 +101,18 @@ class Attention(nn.Module):
 #             if i == 0: m.append(act)
 
 #         self.body = nn.Sequential(*m)
-#         self.res_MGCBle = res_MGCBle
+#         self.res_scale = res_scale
 
 #     def forward(self, x):
-#         res = self.body(x).mul(self.res_MGCBle)
+#         res = self.body(x).mul(self.res_scale)
 #         res += x
 
 #         return res
 
 # residual attention block
-class MGRB(nn.Module):
-    def __init__(self, conv, in_channels, kernel_size, reduction, bias=True, bn=False, act=nn.PReLU(), res_MGCBle=1):
-        super(MGRB, self).__init__()
+class RAB(nn.Module):
+    def __init__(self, conv, in_channels, kernel_size, reduction, bias=True, bn=False, act=nn.PReLU(), res_scale=1):
+        super(RAB, self).__init__()
         m = []
         for i in range(2):
             m.append(conv(in_channels, in_channels, kernel_size, bias=bias))
@@ -117,7 +120,7 @@ class MGRB(nn.Module):
             if i == 0: m.append(act)
         m.append(Attention(in_channels, reduction))
         self.body = nn.Sequential(*m)
-        self.res_MGCBle = res_MGCBle
+        self.res_scale = res_scale
 
     def forward(self, x):
         res = self.body(x)
@@ -127,11 +130,11 @@ class MGRB(nn.Module):
 
 # feature extraction module
 class FEM(nn.Module):
-    def __init__(self, conv, in_channels, kernel_size, reduction, act, res_MGCBle, n_resblocks):
+    def __init__(self, conv, in_channels, kernel_size, reduction, act, res_scale, n_resblocks):
         super(FEM, self).__init__()
         modules_body = []
         modules_body = [
-            MGRB(conv, in_channels, kernel_size, reduction, bias=True, bn=False, act=nn.PReLU(), res_MGCBle=1) \
+            RAB(conv, in_channels, kernel_size, reduction, bias=True, bn=False, act=nn.PReLU(), res_scale=1) \
             for _ in range(n_resblocks)]
         modules_body.append(conv(in_channels, in_channels, kernel_size))
         self.body = nn.Sequential(*modules_body)
@@ -152,7 +155,7 @@ class Net(nn.Module):
         in_channels = 64
         kernel_size = 3
         n_colors = 1
-        res_MGCBle = 1
+        res_scale = 1
         act = nn.PReLU()
         reduction = 16
         self.n_modules = n_modules
@@ -161,11 +164,11 @@ class Net(nn.Module):
         m_head = [conv(n_colors, in_channels, kernel_size)]
 
         # define body module
-        m_body = [FEM(conv, in_channels, kernel_size, reduction, act, res_MGCBle, n_resblocks), P2NM(),
-                  FEM(conv, in_channels, kernel_size, reduction, act, res_MGCBle, (n_resblocks - 2) // 2), P2NM(),
-                  FEM(conv, in_channels, kernel_size, reduction, act, res_MGCBle, (n_resblocks - 2) // 2), P2NM(),
-                  FEM(conv, in_channels, kernel_size, reduction, act, res_MGCBle, (n_resblocks - 2) // 2), P2NM(),
-                  FEM(conv, in_channels, kernel_size, reduction, act, res_MGCBle, n_resblocks)]
+        m_body = [FEM(conv, in_channels, kernel_size, reduction, act, res_scale, n_resblocks), PNLA(),
+                  FEM(conv, in_channels, kernel_size, reduction, act, res_scale, (n_resblocks - 2) // 2), PNLA(),
+                  FEM(conv, in_channels, kernel_size, reduction, act, res_scale, (n_resblocks - 2) // 2), PNLA(),
+                  FEM(conv, in_channels, kernel_size, reduction, act, res_scale, (n_resblocks - 2) // 2), PNLA(),
+                  FEM(conv, in_channels, kernel_size, reduction, act, res_scale, n_resblocks)]
 
         # define tail module
         m_tail = [conv(in_channels, n_colors, kernel_size)]
@@ -206,6 +209,8 @@ class Net(nn.Module):
 """
 fundamental functions
 """
+
+
 def same_padding(images, ksizes, strides, rates):
     assert len(images.size()) == 4
     batch_size, channel, rows, cols = images.size()
@@ -254,14 +259,14 @@ def extract_image_patches(images, ksizes, strides, rates, padding='same'):
 
 
 # patch-wise non-local attention
-class P2NM(nn.Module):
-    def __init__(self, ksize=7, stride_1=4, stride_2=1, softmax_MGCBle=10, in_channels=64,
+class PNLA(nn.Module):
+    def __init__(self, ksize=7, stride_1=4, stride_2=1, softmax_scale=10, in_channels=64,
                  inter_channels=16):
-        super(P2NM, self).__init__()
+        super(PNLA, self).__init__()
         self.ksize = ksize
         self.stride_1 = stride_1
         self.stride_2 = stride_2
-        self.softmax_MGCBle = softmax_MGCBle
+        self.softmax_scale = softmax_scale
         self.inter_channels = inter_channels
         self.in_channels = in_channels
         self.strides = [1, 2, 4]
@@ -348,7 +353,7 @@ class P2NM(nn.Module):
                 b_s, l_s, h_s, w_s = score_map.shape
 
                 yi = score_map.view(b_s, l_s, -1)  # [1, L1, h*w]
-                yi = F.softmax(yi * self.softmax_MGCBle, dim=2).view(l_s, -1)
+                yi = F.softmax(yi * self.softmax_scale, dim=2).view(l_s, -1)
                 gi = gi.view(h_s * w_s, -1)  # [1, h*w, k*k*c]
                 yi = torch.mm(yi, gi)  # [1, L1, k*k*c]
                 yi = yi.view(b_s, l_s, c_s, k_s, k_s)[0]
@@ -369,8 +374,13 @@ class P2NM(nn.Module):
         return out
 
 
-# if __name__ == '__main__':
-#     net = Net()
-#     from torchstat import stat
+if __name__ == "__main__":
+    # exit(0)
+    from thop import profile
 
-#     stat(net, (1, 12, 12))
+    input = torch.randn(4, 1, 64, 64)
+    net = Net()
+    net(input)
+
+    # from torchstat import stat
+    # stat(net, (1, 64, 64))
